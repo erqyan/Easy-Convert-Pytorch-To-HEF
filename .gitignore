@@ -1,0 +1,68 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== Virtualenv =====
+hailo_venv/
+venv/
+env/
+.venv/
+bin/lib/include/   # leftover venv dirs
+
+# ===== Conversion artifacts (generated, large) =====
+*.onnx
+*.onnx.data
+*.har
+*_optim.har
+*.hef
+*.hef.bak
+*.npy
+*.npz
+
+# Keep the source model? Uncomment next line to ignore .pt too:
+# *.pt
+
+# ===== Hailo DFC / SDK logs =====
+*.log
+acceleras.log
+allocator.log
+hailo_sdk.*.log
+hailo_sdk.client.log
+hailo_sdk.core*.log
+
+# ===== Editor / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-*
+
+# ===== OS =====
+Thumbs.db
+desktop.ini
+
+# ===== Dataset =====
+dataset_yolo/
+
+# Model
+*.pt
+
+# Packages
+*.whl
+*.deb
+
+# Hailo SDK packages
+hailo_dataflow_compiler*
+hailo_gen_ai_model_zoo*
+hailort-pcie-driver*
