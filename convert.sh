@@ -49,6 +49,8 @@ ${B}Options${X} (forwarded to the python converter):
   --calib-dir DIR       Calibration image folder (default: ${DEFAULT_CALIB_DIR})
   --imgsz N             Input image size        (default: read from checkpoint)
   --num-calib N         # calibration images    (default: ${DEFAULT_NUM_CALIB})
+  --batch-size N        Batch size for calib/bias-correction/QFT (default: auto)
+  --qft-epochs N        QFT training epochs     (default: 4)
   --hw-arch ARCH        hailo8l | hailo8        (default: ${DEFAULT_HW_ARCH})
   --out-dir DIR         Output directory        (default: this folder)
   --force               Rebuild every stage

@@ -224,6 +224,101 @@ def run_parse_har(onnx_path, har_path, hw_arch, force):
     log(f"HAR ready: {har_path}")
 
 
+# ---------- GPU helpers ------------------------------------------------------
+def get_gpu_info():
+    """Return (total_vram_mb, free_vram_mb) or (None, None) if no NVIDIA GPU."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+            text=True, timeout=10,
+        )
+        line = out.strip().split("\n")[0].split(", ")
+        return int(line[0]), int(line[1])
+    except Exception:
+        return None, None
+
+
+def pick_batch_size(requested_bs=None):
+    """Choose a safe QFT batch_size based on available GPU memory.
+
+    The Hailo QFT algorithm builds two TF graphs (forward + backward), each
+    holding a full copy of the model plus intermediate activations.  On a
+    4 GB RTX 2050 with ~3.3 GB free, batch_size=4 is about the limit for
+    yolov8n.  Larger models need even smaller batches.
+
+    The user can override this via --batch-size.
+    """
+    total, free = get_gpu_info()
+    if total is None:
+        # No GPU detected — DFC will run on CPU, batch_size doesn't matter
+        # much for VRAM but keep it small to limit RAM usage.
+        return requested_bs or 4
+
+    if requested_bs is not None:
+        log(f"Using user-specified batch_size={requested_bs} (GPU: {total} MB total, {free} MB free)")
+        return requested_bs
+
+    # Auto-pick based on free VRAM.
+    # Empirical: yolov8n QFT needs ~600-700 MB per batch element on GPU.
+    if free >= 8000:
+        bs = 8
+    elif free >= 4000:
+        bs = 4
+    elif free >= 2000:
+        bs = 2
+    else:
+        bs = 1
+    log(f"Auto-selected batch_size={bs} (GPU: {total} MB total, {free} MB free)")
+    return bs
+
+
+# ---------- ALLS model script builder -----------------------------------------
+def build_alls_script(batch_size, num_calib, epochs=4):
+    """Build an ALLS model-optimization script string.
+
+    The script explicitly enables BOTH bias correction AND QFT with tuned
+    parameters.  This avoids the SDK's auto-detection which:
+      - At level 1 (dataset < 1024): enables bias correction but SKIPS QFT
+      - At level 2 (dataset >= 1024): enables QFT but SKIPS bias correction
+
+    We want both, with batch sizes that fit in the available GPU memory.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size for calibration, bias correction, and QFT.
+    num_calib : int
+        Number of calibration / training images.
+    epochs : int
+        QFT training epochs (default 4).
+    """
+    # Clamp dataset_size for QFT to what we actually have.
+    dataset_size = min(num_calib, 1024)
+    # val_batch_size is independent of training batch_size and also consumes
+    # GPU memory.  Keep it proportional but capped to avoid OOM.
+    val_batch_size = min(batch_size * 16, 64)
+    val_images = min(num_calib * 4, 4096)
+
+    script = (
+        # Base calibration config with explicit batch size
+        f"model_optimization_config(calibration, batch_size={batch_size}, calibset_size={num_calib})\n"
+        # Set optimization level to 2 so the flow runs QFT, but override
+        # individual algorithm settings below.
+        f"model_optimization_flavor(optimization_level=2, batch_size={batch_size})\n"
+        # Bias correction: enabled explicitly (level 2 disables it by default).
+        # NOTE: ALLS enum values must NOT be quoted (e.g. policy=enabled).
+        f"post_quantization_optimization(bias_correction, "
+        f"policy=enabled, batch_size={batch_size}, calibset_size={num_calib})\n"
+        # QFT: enabled with reduced batch_size to fit in GPU memory.
+        # dataset_size controls how many images QFT uses for training.
+        f"post_quantization_optimization(finetune, "
+        f"policy=enabled, batch_size={batch_size}, dataset_size={dataset_size}, "
+        f"epochs={epochs}, val_batch_size={val_batch_size}, val_images={val_images})\n"
+    )
+    return script
+
+
 # ---------- stage 3: calibrate + optimize -----------------------------------
 def collect_calib_images(calib_dir):
     exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG")
@@ -244,7 +339,8 @@ def load_calib(images, imgsz, limit):
     return np.stack(arrs)
 
 
-def run_optimize(har_path, opt_har_path, calib_dir, imgsz, num_calib, force):
+def run_optimize(har_path, opt_har_path, calib_dir, imgsz, num_calib,
+                 force, batch_size=None, qft_epochs=4):
     if os.path.exists(opt_har_path) and not force:
         log(f"Optimized HAR already exists: {opt_har_path}  (use --force to rebuild)")
         return
@@ -255,7 +351,22 @@ def run_optimize(har_path, opt_har_path, calib_dir, imgsz, num_calib, force):
     calib_data = load_calib(images, imgsz, num_calib)
     log(f"Calibration tensor shape: {calib_data.shape}")
 
+    # Auto-detect safe batch_size for the GPU, or use user override.
+    bs = pick_batch_size(batch_size)
+
+    # Build an explicit ALLS script to enable both bias correction AND QFT
+    # with batch sizes that fit in the available GPU memory.
+    alls_script = build_alls_script(
+        batch_size=bs,
+        num_calib=num_calib,
+        epochs=qft_epochs,
+    )
+    log("ALLS optimization script:")
+    for line in alls_script.strip().split("\n"):
+        log(f"  {line}")
+
     runner = ClientRunner(har=har_path)
+    runner.load_model_script(alls_script)
     runner.optimize(calib_data)
     runner.save_har(opt_har_path)
     log(f"Optimized HAR ready: {opt_har_path}")
@@ -291,6 +402,12 @@ def run_stage_in_subprocess(stage, args):
         "--hw-arch", args.hw_arch,
         "--out-dir", args.out_dir,
     ]
+    # Forward optional params if set.
+    if args.batch_size:
+        cmd += ["--batch-size", str(args.batch_size)]
+    if args.qft_epochs:
+        cmd += ["--qft-epochs", str(args.qft_epochs)]
+
     log(f"running stage '{stage}' in isolated subprocess...")
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
@@ -312,7 +429,8 @@ def stage_dispatch(args):
     elif args.stage == "parse":
         run_parse_har(onnx_path, har_path, args.hw_arch, True)
     elif args.stage == "optimize":
-        run_optimize(har_path, opt_har_path, args.calib_dir, args.imgsz, args.num_calib, True)
+        run_optimize(har_path, opt_har_path, args.calib_dir, args.imgsz,
+                     args.num_calib, True, args.batch_size, args.qft_epochs)
     elif args.stage == "compile":
         run_compile(opt_har_path, hef_path, True)
     else:
@@ -389,6 +507,10 @@ def main():
                         help="Input size (default: read from checkpoint, else 640)")
     parser.add_argument("--num-calib", type=int, default=300,
                         help="Number of calibration images (default: 300; 1024+ for best accuracy)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Batch size for calibration/bias-correction/QFT (default: auto-detect from GPU VRAM)")
+    parser.add_argument("--qft-epochs", type=int, default=4,
+                        help="QFT training epochs (default: 4; more epochs = better accuracy, slower)")
     parser.add_argument("--hw-arch", default="hailo8l", choices=["hailo8l", "hailo8"],
                         help="Target hardware arch (default: hailo8l for the Pi 5 AI Hat)")
     parser.add_argument("--out-dir", default=here, help="Where to write artifacts (default: this folder)")
